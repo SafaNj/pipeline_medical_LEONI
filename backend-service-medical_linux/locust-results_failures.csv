@@ -1,0 +1,4 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+GET,GET /api/stock/stocks/alertes/,CatchResponseError('Alertes: 403'),154,2026-05-17T03:08:10Z,2026-05-17T03:09:03Z
+GET,GET /api/medical-work/listes-visites-periodiques/,CatchResponseError('VP: 403'),389,2026-05-17T03:08:12Z,2026-05-17T03:09:04Z
+GET,GET /api/stock/medicaments/,CatchResponseError('Stock: 403'),202,2026-05-17T03:08:10Z,2026-05-17T03:09:04Z

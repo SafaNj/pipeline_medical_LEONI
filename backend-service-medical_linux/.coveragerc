@@ -1,0 +1,10 @@
+[run]
+source = apps
+omit =
+    */migrations/*
+    conftest.py
+
+[report]
+omit =
+    */migrations/*
+    conftest.py

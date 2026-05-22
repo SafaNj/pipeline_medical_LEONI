@@ -1,0 +1,28 @@
+# Python
+backend-service-medical_linux/venv/
+backend-service-medical_linux/__pycache__/
+backend-service-medical_linux/*.pyc
+backend-service-medical_linux/.coverage
+backend-service-medical_linux/htmlcov/
+backend-service-medical_linux/test-results/
+backend-service-medical_linux/.pytest_cache/
+
+# Node
+frontend-service-medical_linux/node_modules/
+frontend-service-medical_linux/dist/
+frontend-service-medical_linux/playwright-report/
+frontend-service-medical_linux/test-results/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfplan
+terraform/tfplan
+*.tfplan
+
+# Secrets
+terraform/terraform.tfvars
+*.pem
+.env
+
+# OS
+.DS_Store
