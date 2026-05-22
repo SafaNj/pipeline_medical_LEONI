@@ -258,7 +258,7 @@ PY
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
           chmod 600 ~/.ssh/labsuser.pem
 
-      - name: Demarrer et verifier les services
+      - name: Demarrer backend et verifier les services
         env:
           SERVER_IP: ${{ steps.get_ip.outputs.server_ip }}
         run: |
@@ -266,12 +266,39 @@ PY
             set -e
             echo "=== Demarrage des services ==="
 
-            sudo systemctl is-active mysql          || sudo systemctl start mysql
+            # MySQL
+            sudo systemctl is-active mysql || sudo systemctl start mysql
             sleep 2
-            sudo systemctl is-active medical-backend || sudo systemctl start medical-backend
-            sudo systemctl is-active nginx           || sudo systemctl start nginx
 
-            sleep 5
+            # Arreter tout ce qui tourne sur le port 8000 (gunicorn ou runserver)
+            echo "Liberation du port 8000..."
+            sudo fuser -k 8000/tcp 2>/dev/null || true
+            sudo systemctl stop medical-backend 2>/dev/null || true
+            sleep 2
+
+            # Recreer le venv si absent ou corrompu
+            if [ ! -f /opt/backend/venv/bin/python ]; then
+              echo "Venv absent — recreation..."
+              sudo rm -rf /opt/backend/venv
+              sudo python3 -m venv /opt/backend/venv
+              sudo /opt/backend/venv/bin/pip install -r /opt/backend/requirements.txt -q
+              sudo chown -R ubuntu:ubuntu /opt/backend/venv
+            fi
+
+            # Lancer Django runserver en arriere-plan
+            echo "Lancement de Django runserver sur :8000..."
+            source /opt/backend/venv/bin/activate
+            cd /opt/backend
+            nohup python manage.py runserver 0.0.0.0:8000 \
+              > /tmp/backend.log 2>&1 &
+            echo $! > /tmp/backend.pid
+            echo "Backend PID : $(cat /tmp/backend.pid)"
+            deactivate
+
+            # nginx (sert le frontend build)
+            sudo systemctl is-active nginx || sudo systemctl start nginx
+
+            sleep 8
 
             echo ""
             echo "=== Verification des endpoints ==="
@@ -281,8 +308,8 @@ PY
               http://localhost/         || echo "Frontend : en cours de demarrage..."
 
             echo ""
-            echo "=== Statut systemd ==="
-            sudo systemctl status medical-backend nginx mysql --no-pager | grep -E "Active:|●"
+            echo "=== Logs backend (10 dernieres lignes) ==="
+            tail -10 /tmp/backend.log || true
           REMOTE
 
       - name: Afficher les URLs de l'application
@@ -297,6 +324,7 @@ PY
           echo "  Frontend  : http://$SERVER_IP"
           echo "  Backend   : http://$SERVER_IP:8000"
           echo "  API       : http://$SERVER_IP/api/"
+          echo "  Vite dev  : http://$SERVER_IP:5173  (si vite en mode dev)"
           echo "  API proxy : http://$SERVER_IP/api/  (via nginx)"
           echo ""
           echo "  SSH       : ssh -i labsuser.pem ubuntu@$SERVER_IP"
