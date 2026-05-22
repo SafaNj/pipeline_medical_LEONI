@@ -33,9 +33,15 @@ cp -r "$FRONTEND_ROOT"/. "$INSTALL_DIR/"
 # We deliberately leave VITE_API_BASE_URL unset so the nginx proxy is used.
 cd "$INSTALL_DIR"
 
+# Remove any stale node_modules that came bundled inside the zip
+rm -rf "$INSTALL_DIR/node_modules"
+
 # ── npm install + build ───────────────────────────────────────────────────
 echo "[frontend] Installing npm dependencies..."
-npm install --legacy-peer-deps --prefer-offline 2>&1 | tail -5
+npm install --legacy-peer-deps 2>&1 | tail -5
+
+# react-is is an undeclared peer dep of recharts; Vite 8/Rolldown requires it explicitly
+npm install react-is --legacy-peer-deps --silent
 
 echo "[frontend] Building production bundle..."
 npm run build 2>&1
