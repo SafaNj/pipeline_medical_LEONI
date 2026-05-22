@@ -1,0 +1,354 @@
+name: "DAST - Tests Dynamiques de Securite"
+
+# Declenchement : apres le pipeline de deploiement, ou manuellement
+on:
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "IP cible (laisser vide = lire depuis terraform.tfstate)"
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["Deploy Medical Project"]
+    types: [completed]
+    branches: [main]
+
+# =============================================================
+#  DAST — 6 phases complementaires au SAST (tests.yml)
+#
+#  Ordre d'execution (du plus rapide au plus long) :
+#  0. prepare          → recuperer l'IP de la cible depuis tfstate
+#  1. security-headers → verification en-tetes HTTP (CSP, HSTS, etc.)
+#  2. zap-passive      → OWASP ZAP scan passif (baseline, sans attaque)
+#  3. api-probes       → sondes actives : SQLi, XSS, bypass auth, IDOR
+#  4. auth-security    → JWT, brute-force, CORS, session management
+#  5. zap-active       → OWASP ZAP scan actif complet (attaques OWASP)
+#  6. report           → synthese globale DAST
+# =============================================================
+
+jobs:
+
+  # ── Job 0 : recuperer l'IP de la cible ──────────────────────────────────
+  prepare:
+    name: "Phase 0 - Preparation cible DAST"
+    runs-on: ubuntu-latest
+    outputs:
+      target_ip: ${{ steps.get_ip.outputs.target_ip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determiner IP de la cible
+        id: get_ip
+        run: |
+          TARGET_IP="${{ github.event.inputs.target_ip }}"
+
+          if [ -z "$TARGET_IP" ] && [ -f terraform/terraform.tfstate ]; then
+            TARGET_IP=$(jq -r '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' terraform/terraform.tfstate 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
+            echo "ERREUR : aucune IP trouvee dans tfstate. Deployez d abord via deploy.yml"
+            exit 1
+          fi
+
+          echo "Cible DAST : http://$TARGET_IP"
+          echo "target_ip=$TARGET_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Verifier accessibilite de la cible
+        env:
+          TARGET_IP: ${{ steps.get_ip.outputs.target_ip }}
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$TARGET_IP/" --max-time 10 || echo "000")
+          echo "Frontend HTTP $STATUS"
+          STATUS_API=$(curl -s -o /dev/null -w "%{http_code}" "http://$TARGET_IP/api/account/login/" --max-time 10 -X POST -H "Content-Type: application/json" -d '{"username":"x","password":"x"}' || echo "000")
+          echo "API      HTTP $STATUS_API"
+          if [ "$STATUS" = "000" ]; then
+            echo "WARN : frontend inaccessible - les scans peuvent echouer"
+          fi
+
+  # ── Job 1 : verification en-tetes HTTP (rapide) ─────────────────────────
+  security-headers:
+    name: "Phase 1 - En-tetes HTTP de Securite"
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Analyser les en-tetes HTTP du frontend
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== En-tetes HTTP : http://$TARGET/ ==="
+          HEADERS=$(curl -sI "http://$TARGET/" --max-time 10 || echo "")
+          echo "$HEADERS"
+          echo ""
+          echo "=== Analyse des en-tetes de securite ==="
+          SCORE=0
+          TOTAL=6
+          for header in "X-Content-Type-Options" "X-Frame-Options" "Content-Security-Policy" "Referrer-Policy" "Permissions-Policy" "Strict-Transport-Security"; do
+            if echo "$HEADERS" | grep -qi "^$header:"; then
+              echo "  PRESENT  $header"
+              SCORE=$((SCORE + 1))
+            else
+              echo "  ABSENT   $header"
+            fi
+          done
+          echo ""
+          echo "  Score securite en-tetes : $SCORE/$TOTAL"
+
+      - name: Analyser les en-tetes HTTP de l API
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== En-tetes HTTP : http://$TARGET/api/ ==="
+          curl -sI "http://$TARGET/api/" --max-time 10 || true
+          echo ""
+          echo "=== Verification server disclosure ==="
+          SERVER=$(curl -sI "http://$TARGET/" --max-time 10 | grep -i "^Server:" || echo "  Server: non divulgue")
+          echo "$SERVER"
+          if echo "$SERVER" | grep -qi "nginx\|apache\|gunicorn\|python"; then
+            echo "  WARN : version serveur divulguee"
+          else
+            echo "  OK   : pas de disclosure de version"
+          fi
+
+  # ── Job 2 : OWASP ZAP scan passif (baseline) ────────────────────────────
+  zap-passive:
+    name: "Phase 2 - OWASP ZAP Scan Passif (Baseline)"
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Checkout (pour rules.tsv)
+        uses: actions/checkout@v4
+
+      - name: ZAP Baseline - Frontend (port 80)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://${{ needs.prepare.outputs.target_ip }}"
+          rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: Renommer rapport ZAP frontend
+        run: mv report_html.html zap_frontend.html 2>/dev/null || true
+
+      - name: ZAP Baseline - API (port 8000)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://${{ needs.prepare.outputs.target_ip }}:8000"
+          rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: Renommer rapport ZAP API
+        run: mv report_html.html zap_api.html 2>/dev/null || true
+
+      - name: Upload rapports ZAP passifs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-passive-reports
+          path: "*.html"
+
+  # ── Job 3 : sondes actives API ───────────────────────────────────────────
+  api-probes:
+    name: "Phase 3 - Sondes API (SQLi, XSS, Bypass, IDOR)"
+    runs-on: ubuntu-latest
+    needs: [prepare, zap-passive, security-headers]
+    steps:
+      - name: Test injection SQL - endpoint login
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Injection SQL — endpoint /api/account/login/ ==="
+          for payload in "' OR '1'='1" "admin'--" "1; DROP TABLE users--" "' UNION SELECT 1,2,3--"; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://$TARGET/api/account/login/" -H "Content-Type: application/json" -d "{\"username\":\"$payload\",\"password\":\"test\"}" --max-time 5 || echo "000")
+            echo "  SQLi [$payload] -> HTTP $STATUS"
+          done
+
+      - name: Test injection XSS - parametres GET
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Injection XSS — parametres URL ==="
+          for xss in "<script>alert(1)</script>" "javascript:alert(1)" "<img src=x onerror=alert(1)>"; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$TARGET/api/?q=$xss" --max-time 5 || echo "000")
+            echo "  XSS [$xss] -> HTTP $STATUS"
+          done
+
+      - name: Test bypass authentification
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Bypass authentification — endpoints proteges ==="
+          ENDPOINTS="/api/account/users/ /api/consultations/ /api/stock/ /api/planning/ /api/employees/"
+          for ep in $ENDPOINTS; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$TARGET$ep" --max-time 5 || echo "000")
+            echo "  Sans auth [$ep] -> HTTP $STATUS (attendu: 401/403)"
+          done
+
+      - name: Test IDOR - enumeration ID
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== IDOR — enumeration d IDs ==="
+          for id in 1 2 3 99 100 9999; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$TARGET/api/account/users/$id/" --max-time 5 || echo "000")
+            echo "  /api/account/users/$id/ -> HTTP $STATUS"
+          done
+
+      - name: Test methodes HTTP non autorisees
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Methodes HTTP non autorisees ==="
+          for method in DELETE PUT PATCH TRACE; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X "$method" "http://$TARGET/api/account/login/" --max-time 5 || echo "000")
+            echo "  $method /api/account/login/ -> HTTP $STATUS"
+          done
+
+  # ── Job 4 : securite authentification JWT ───────────────────────────────
+  auth-security:
+    name: "Phase 4 - Securite JWT, Brute-force, CORS"
+    runs-on: ubuntu-latest
+    needs: [prepare, api-probes]
+    steps:
+      - name: Test tokens JWT invalides
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Tokens JWT invalides ==="
+          echo "  Aucun token:"
+          curl -s -o /dev/null -w "  -> HTTP %{http_code}\n" "http://$TARGET/api/account/users/" --max-time 5 || true
+
+          echo "  Token vide:"
+          curl -s -o /dev/null -w "  -> HTTP %{http_code}\n" "http://$TARGET/api/account/users/" -H "Authorization: Bearer " --max-time 5 || true
+
+          echo "  Token mal forme:"
+          curl -s -o /dev/null -w "  -> HTTP %{http_code}\n" "http://$TARGET/api/account/users/" -H "Authorization: Bearer not.a.valid.jwt" --max-time 5 || true
+
+          echo "  Algorithme none:"
+          NONE_JWT="eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VyX2lkIjoxfQ."
+          curl -s -o /dev/null -w "  -> HTTP %{http_code}\n" "http://$TARGET/api/account/users/" -H "Authorization: Bearer $NONE_JWT" --max-time 5 || true
+
+      - name: Test protection brute-force login
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Protection brute-force (10 tentatives) ==="
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://$TARGET/api/account/login/" -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"wrong$i\"}" --max-time 5 || echo "000")
+            echo "  Tentative $i -> HTTP $STATUS"
+          done
+          echo "  Si toutes les reponses sont 400 (pas de 429/lockout) -> WARN brute-force non protege"
+
+      - name: Test CORS malicieux
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Verification CORS ==="
+          RESPONSE=$(curl -sI -X OPTIONS "http://$TARGET/api/account/login/" -H "Origin: http://evil.example.com" -H "Access-Control-Request-Method: POST" --max-time 10 || echo "")
+          echo "$RESPONSE"
+          ACAO=$(echo "$RESPONSE" | grep -i "Access-Control-Allow-Origin" || echo "  Absent")
+          echo "  ACAO header: $ACAO"
+          if echo "$ACAO" | grep -q "\*"; then
+            echo "  WARN: CORS wildcard (*) detecte — acces depuis n importe quel domaine"
+          else
+            echo "  OK: CORS restreint a des domaines specifiques"
+          fi
+
+      - name: Test refresh token invalide
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Refresh token invalide ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://$TARGET/api/account/refresh/" -H "Content-Type: application/json" -d '{"refresh":"fake.invalid.refresh.token"}' --max-time 5 || echo "000")
+          echo "  Refresh invalide -> HTTP $STATUS (attendu: 401)"
+
+      - name: Test clickjacking (X-Frame-Options)
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          echo "=== Clickjacking ==="
+          XFO=$(curl -sI "http://$TARGET/" --max-time 10 | grep -i "X-Frame-Options" || echo "  Absent")
+          echo "  X-Frame-Options: $XFO"
+          CSP=$(curl -sI "http://$TARGET/" --max-time 10 | grep -i "Content-Security-Policy" || echo "  Absent")
+          echo "  CSP frame-ancestors: $CSP"
+
+  # ── Job 5 : OWASP ZAP scan actif complet (le plus long) ─────────────────
+  zap-active:
+    name: "Phase 5 - OWASP ZAP Scan Actif Complet"
+    runs-on: ubuntu-latest
+    needs: [prepare, auth-security]
+    steps:
+      - name: Checkout (pour rules.tsv)
+        uses: actions/checkout@v4
+
+      - name: ZAP Full Active Scan - Application complete
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: "http://${{ needs.prepare.outputs.target_ip }}"
+          rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
+          fail_action: false
+          allow_issue_writing: false
+          cmd_options: "-T 10"
+        continue-on-error: true
+
+      - name: Renommer rapport ZAP actif
+        run: mv report_html.html zap_active_report.html 2>/dev/null || true
+
+      - name: ZAP API Scan - Endpoints /api/
+        uses: zaproxy/action-api-scan@v0.7.0
+        with:
+          target: "http://${{ needs.prepare.outputs.target_ip }}/api/"
+          fail_action: false
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: Renommer rapport ZAP API
+        run: mv report_html.html zap_api_active_report.html 2>/dev/null || true
+
+      - name: Upload rapports ZAP actifs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-active-reports
+          path: "*.html"
+
+  # ── Job 6 : synthese DAST ────────────────────────────────────────────────
+  report:
+    name: "Phase 6 - Synthese DAST"
+    runs-on: ubuntu-latest
+    needs: [prepare, security-headers, zap-passive, api-probes, auth-security, zap-active]
+    if: always()
+    steps:
+      - name: Rapport de synthese DAST
+        env:
+          TARGET: ${{ needs.prepare.outputs.target_ip }}
+          H_RESULT: ${{ needs.security-headers.result }}
+          ZAP_P_RESULT: ${{ needs.zap-passive.result }}
+          API_RESULT: ${{ needs.api-probes.result }}
+          AUTH_RESULT: ${{ needs.auth-security.result }}
+          ZAP_A_RESULT: ${{ needs.zap-active.result }}
+        run: |
+          echo ""
+          echo "======================================================="
+          echo "  RAPPORT DAST — PLATEFORME MEDICALE LEONI"
+          echo "  Cible : http://$TARGET"
+          echo "======================================================="
+          echo ""
+          echo "  Phase 1 - En-tetes HTTP         : $H_RESULT"
+          echo "  Phase 2 - ZAP Passif (baseline) : $ZAP_P_RESULT"
+          echo "  Phase 3 - Sondes API             : $API_RESULT"
+          echo "  Phase 4 - Securite JWT/CORS      : $AUTH_RESULT"
+          echo "  Phase 5 - ZAP Actif complet      : $ZAP_A_RESULT"
+          echo ""
+          echo "  Artefacts disponibles dans GitHub Actions :"
+          echo "  - zap-passive-reports/   : scan passif frontend + API"
+          echo "  - zap-active-reports/    : scan actif + API scan"
+          echo ""
+          echo "  Complementarite avec le SAST (tests.yml) :"
+          echo "  SAST : Bandit, Safety, pytest injection, JWT unit tests"
+          echo "  DAST : ZAP actif/passif, sondes HTTP live, CORS, IDOR"
+          echo "======================================================="
