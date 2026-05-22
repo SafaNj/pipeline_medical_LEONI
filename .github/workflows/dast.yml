@@ -13,6 +13,15 @@ on:
     types: [completed]
     branches: [main]
 
+# Permissions pour ecrire les artefacts
+permissions:
+  contents: read
+  actions: write
+
+# Forcer Node.js 24 pour eviter les warnings de deprecation Node.js 20
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # =============================================================
 #  DAST — 6 phases complementaires au SAST (tests.yml)
 #
@@ -127,6 +136,7 @@ jobs:
           rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
           fail_action: false
           allow_issue_writing: false
+          artifact_name: "zap-baseline-frontend"
         continue-on-error: true
 
       - name: Renommer rapport ZAP frontend
@@ -139,6 +149,7 @@ jobs:
           rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
           fail_action: false
           allow_issue_writing: false
+          artifact_name: "zap-baseline-api"
         continue-on-error: true
 
       - name: Renommer rapport ZAP API
@@ -292,6 +303,7 @@ jobs:
           rules_file_name: "backend-service-medical_linux/.zap/rules.tsv"
           fail_action: false
           allow_issue_writing: false
+          artifact_name: "zap-full-scan"
           cmd_options: "-T 10"
         continue-on-error: true
 
@@ -304,6 +316,7 @@ jobs:
           target: "http://${{ needs.prepare.outputs.target_ip }}/api/"
           fail_action: false
           allow_issue_writing: false
+          artifact_name: "zap-api-scan"
         continue-on-error: true
 
       - name: Renommer rapport ZAP API
