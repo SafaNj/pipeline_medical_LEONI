@@ -1,0 +1,111 @@
+name: "Destroy Infrastructure"
+
+# Declenchement uniquement manuel — protection contre les suppressions accidentelles
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Tapez 'destroy' pour confirmer la suppression de l'infrastructure"
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.7.5"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  destroy:
+    name: "Terraform Destroy — Suppression Infrastructure AWS"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'destroy'
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Installer Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Importer ressources existantes avant destroy
+        working-directory: ./terraform
+        run: |
+          echo "Synchronisation du state avec AWS avant destruction..."
+
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=medical-app-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          if [ "$SG_ID" != "None" ] && [ "$SG_ID" != "null" ] && [ -n "$SG_ID" ]; then
+            echo "Security Group trouve : $SG_ID"
+            terraform import aws_security_group.medical_sg "$SG_ID" 2>/dev/null || true
+          fi
+
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=medical-app-server" \
+                      "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || echo "None")
+          if [ "$INSTANCE_ID" != "None" ] && [ "$INSTANCE_ID" != "null" ] && [ -n "$INSTANCE_ID" ]; then
+            echo "Instance EC2 trouvee : $INSTANCE_ID"
+            terraform import aws_instance.medical_app "$INSTANCE_ID" 2>/dev/null || true
+          fi
+
+          EIP_ALLOC=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=medical-app-eip" \
+            --query "Addresses[0].AllocationId" --output text 2>/dev/null || echo "None")
+          if [ "$EIP_ALLOC" != "None" ] && [ "$EIP_ALLOC" != "null" ] && [ -n "$EIP_ALLOC" ]; then
+            echo "Elastic IP trouvee : $EIP_ALLOC"
+            terraform import aws_eip.medical_eip "$EIP_ALLOC" 2>/dev/null || true
+          fi
+
+      - name: Terraform Destroy
+        working-directory: ./terraform
+        run: |
+          terraform destroy \
+            -var="db_app_password=placeholder" \
+            -var="mysql_root_password=placeholder" \
+            -auto-approve
+
+      - name: Nettoyer le state dans le repo
+        working-directory: ./terraform
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git pull --rebase origin main || true
+          rm -f terraform.tfstate terraform.tfstate.backup
+          git add terraform.tfstate terraform.tfstate.backup 2>/dev/null || true
+          git diff --cached --quiet || \
+            git commit -m "chore: clean terraform state after destroy [skip ci]"
+          git push || echo "Push du state echoue (non bloquant)"
+
+      - name: Resultat
+        run: |
+          echo ""
+          echo "============================================="
+          echo "   INFRASTRUCTURE SUPPRIMEE AVEC SUCCES"
+          echo "============================================="
+          echo ""
+          echo "  Ressources detruites :"
+          echo "  - Instance EC2 (medical-app-server)"
+          echo "  - Elastic IP  (medical-app-eip)"
+          echo "  - Security Group (medical-app-sg)"
+          echo "  - Terraform state nettoye du repo"
+          echo ""
+          echo "  Pour redeployer : Actions -> Deploy Medical Project"
+          echo "============================================="
