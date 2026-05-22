@@ -209,20 +209,46 @@ jobs:
           REMOTE_SCRIPT: |
             #!/bin/bash
             set -e
+
+            echo "=== Attente du bootstrap user_data (max 25 min) ==="
+            for i in $(seq 1 50); do
+              if grep -q "Bootstrap complete" /var/log/medical-bootstrap.log 2>/dev/null; then
+                echo "Bootstrap complete detecte apres $((i*30))s"
+                break
+              fi
+              if [ "$i" -eq 50 ]; then
+                echo "WARN: timeout 25min - etat du bootstrap:"
+                tail -10 /var/log/medical-bootstrap.log 2>/dev/null || true
+              else
+                echo "  Attente $i/50 (30s)..."
+                sleep 30
+              fi
+            done
+
             echo "=== MySQL ==="
             sudo systemctl is-active mysql || sudo systemctl start mysql
             sleep 2
+
             echo "=== Liberation port 8000 ==="
             sudo fuser -k 8000/tcp 2>/dev/null || true
             sudo systemctl stop medical-backend 2>/dev/null || true
             sleep 2
-            echo "=== Verification venv ==="
-            if [ ! -f /opt/backend/venv/bin/python ]; then
+
+            echo "=== Backend ==="
+            if [ -f /opt/backend/venv/bin/python ]; then
+              echo "Venv OK - lancement runserver"
+            elif [ -f /opt/backend/requirements.txt ]; then
+              echo "Venv absent - recreation..."
               sudo rm -rf /opt/backend/venv
               sudo python3 -m venv /opt/backend/venv
               sudo /opt/backend/venv/bin/pip install -r /opt/backend/requirements.txt -q
               sudo chown -R ubuntu:ubuntu /opt/backend/venv
+            else
+              echo "ERROR: /opt/backend non configure - bootstrap incomplet"
+              tail -30 /var/log/medical-bootstrap.log 2>/dev/null || true
+              exit 1
             fi
+
             echo "=== Lancement Django runserver ==="
             cd /opt/backend
             source /opt/backend/venv/bin/activate
@@ -230,6 +256,7 @@ jobs:
             echo $! > /tmp/backend.pid
             deactivate
             echo "Backend PID $(cat /tmp/backend.pid)"
+
             echo "=== nginx ==="
             sudo systemctl is-active nginx || sudo systemctl start nginx
             sleep 8
