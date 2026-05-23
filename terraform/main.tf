@@ -44,8 +44,6 @@ resource "aws_instance" "medical_app" {
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.medical_sg.id]
 
-  # Scripts are embedded directly (not base64) to stay under the 16 KB user_data limit.
-  # backend.sh uses $VAR (no braces) so Terraform's ${} engine ignores those tokens.
   user_data = templatefile("user_data.sh", {
     backend_script      = file("install/backend.sh")
     frontend_script     = file("install/frontend.sh")
@@ -54,12 +52,19 @@ resource "aws_instance" "medical_app" {
     elastic_ip          = aws_eip.medical_eip.public_ip
   })
 
-  user_data_replace_on_change = true
-
   root_block_device {
     volume_size           = 20
     volume_type           = "gp3"
     delete_on_termination = true
+  }
+
+  # Ne jamais recreer l'instance a cause d'un changement d'AMI ou de user_data :
+  # - ami      : Canonical publie de nouveaux AMIs regulierement ; cela ne doit pas
+  #              declencher une destruction/recreation silencieuse de la VM.
+  # - user_data: le bootstrap ne s'execute qu'au premier demarrage ; les mises a jour
+  #              applicatives passent par setup.sh (Job 3-4), pas par user_data.
+  lifecycle {
+    ignore_changes = [ami, user_data]
   }
 
   tags = {

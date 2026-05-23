@@ -21,27 +21,89 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verifier si la VM existe et repond
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verifier etat EC2 et demarrer si stoppee
         id: check_vm
         run: |
+          # Recuperer l'IP depuis le tfstate local
           SERVER_IP=""
           if [ -f terraform/terraform.tfstate ]; then
             SERVER_IP=$(jq -r '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' terraform/terraform.tfstate 2>/dev/null || echo "")
           fi
 
-          if [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
-            echo "IP trouvee dans tfstate : $SERVER_IP"
+          # Interroger AWS directement pour connaitre l'etat reel de l'instance
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=medical-app-server" \
+                      "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text 2>/dev/null || echo "None")
+
+          INSTANCE_STATE=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=medical-app-server" \
+                      "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text 2>/dev/null || echo "None")
+
+          echo "Instance ID    : $INSTANCE_ID"
+          echo "Instance State : $INSTANCE_STATE"
+
+          # Instance stoppee intentionnellement : la demarrer, NE PAS la recreer
+          if [ "$INSTANCE_STATE" = "stopped" ]; then
+            echo "Instance stoppee detectee — demarrage sans recreation..."
+            aws ec2 start-instances --instance-ids "$INSTANCE_ID"
+            echo "Attente etat 'running' (max 5 min)..."
+            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+            # Recuperer l'IP si elle n'etait pas dans le tfstate
+            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "null" ]; then
+              SERVER_IP=$(aws ec2 describe-instances \
+                --instance-ids "$INSTANCE_ID" \
+                --query "Reservations[0].Instances[0].PublicIpAddress" \
+                --output text 2>/dev/null || echo "")
+            fi
+
+            echo "Attente SSH sur $SERVER_IP (max 5 min)..."
             mkdir -p ~/.ssh
             echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
             chmod 600 ~/.ssh/labsuser.pem
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i ~/.ssh/labsuser.pem ubuntu@"$SERVER_IP" "echo ok" 2>/dev/null; then
+            for i in $(seq 1 30); do
+              if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+                 -i ~/.ssh/labsuser.pem ubuntu@"$SERVER_IP" "echo ok" 2>/dev/null; then
+                echo "SSH pret apres $((i * 10))s"
+                break
+              fi
+              echo "  Tentative SSH $i/30..."
+              sleep 10
+            done
+
+            echo "vm_exists=true"       >> "$GITHUB_OUTPUT"
+            echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Instance deja en cours d'execution : verifier SSH
+          if [ "$INSTANCE_STATE" = "running" ] && [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
+            echo "Instance running — verification SSH sur $SERVER_IP..."
+            mkdir -p ~/.ssh
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
+            chmod 600 ~/.ssh/labsuser.pem
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+               -i ~/.ssh/labsuser.pem ubuntu@"$SERVER_IP" "echo ok" 2>/dev/null; then
               echo "vm_exists=true"       >> "$GITHUB_OUTPUT"
               echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
 
-          echo "Aucune VM active trouvee"
+          # Aucune instance trouvee (ni running ni stopped) : Terraform cree une nouvelle
+          echo "Aucune instance existante — creation via Terraform"
           echo "vm_exists=false" >> "$GITHUB_OUTPUT"
           echo "server_ip="      >> "$GITHUB_OUTPUT"
 
