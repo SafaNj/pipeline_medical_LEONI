@@ -45,10 +45,10 @@ FRONTEND_END
 chmod +x /opt/install/backend.sh /opt/install/frontend.sh
 
 echo "--- Running backend setup ---"
-/opt/install/backend.sh
+DB_APP_PASSWORD="$DB_APP_PASSWORD" MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" ELASTIC_IP="$ELASTIC_IP" bash /opt/install/backend.sh
 
 echo "--- Running frontend setup ---"
-/opt/install/frontend.sh
+ELASTIC_IP="$ELASTIC_IP" bash /opt/install/frontend.sh
 
 echo "=========================================================="
 echo "  Bootstrap complete -- $(date)"
