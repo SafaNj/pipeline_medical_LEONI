@@ -1,0 +1,895 @@
+name: "Monitoring - CloudWatch & CloudTrail"
+
+# Se declenche conjointement au DAST apres chaque deploiement reussi,
+# ou manuellement via workflow_dispatch.
+on:
+  workflow_run:
+    workflows: ["Deploy Medical Project"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: "IP cible (laisser vide = lire depuis terraform.tfstate)"
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ── Job 0 : Recuperer IP, Instance ID et Account ID ─────────────────────
+  prepare:
+    name: "Phase 0 - Preparation"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      target_ip:   ${{ steps.get_info.outputs.target_ip }}
+      instance_id: ${{ steps.get_info.outputs.instance_id }}
+      account_id:  ${{ steps.get_info.outputs.account_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Recuperer IP, Instance ID et Account ID
+        id: get_info
+        run: |
+          TARGET_IP="${{ github.event.inputs.target_ip }}"
+
+          if [ -z "$TARGET_IP" ] && [ -f terraform/terraform.tfstate ]; then
+            TARGET_IP=$(jq -r \
+              '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' \
+              terraform/terraform.tfstate 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
+            echo "ERREUR : IP introuvable. Deployez d'abord via deploy.yml"
+            exit 1
+          fi
+
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=medical-app-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text 2>/dev/null || echo "None")
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          echo "IP        : $TARGET_IP"
+          echo "Instance  : $INSTANCE_ID"
+          echo "Compte    : $ACCOUNT_ID"
+
+          echo "target_ip=$TARGET_IP"     >> "$GITHUB_OUTPUT"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "account_id=$ACCOUNT_ID"   >> "$GITHUB_OUTPUT"
+
+  # ── Job 1 : Agent CloudWatch + Health Check HTTP + Alarme disque ─────────
+  cloudwatch-agent:
+    name: "Phase 1 - CloudWatch Agent & Health Check"
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Configurer SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
+          chmod 600 ~/.ssh/labsuser.pem
+
+      - name: Generer config agent CloudWatch (JSON)
+        run: |
+          cat > /tmp/cloudwatch-agent.json << 'AGENT_CONFIG'
+          {
+            "agent": {
+              "metrics_collection_interval": 60,
+              "logfile": "/var/log/amazon-cloudwatch-agent.log"
+            },
+            "metrics": {
+              "namespace": "MedicalApp/System",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_idle", "cpu_usage_user",
+                    "cpu_usage_system", "cpu_usage_iowait"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "totalcpu": true
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent", "mem_available_percent",
+                    "mem_used", "mem_total"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": ["used_percent", "inodes_free", "disk_free"],
+                  "metrics_collection_interval": 60,
+                  "resources": ["/"]
+                },
+                "diskio": {
+                  "measurement": [
+                    "reads", "writes",
+                    "read_bytes", "write_bytes", "iops_in_progress"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "net": {
+                  "measurement": [
+                    "bytes_recv", "bytes_sent",
+                    "packets_recv", "packets_sent",
+                    "err_in", "err_out"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": ["eth0"]
+                },
+                "swap": {
+                  "measurement": ["swap_used_percent"],
+                  "metrics_collection_interval": 60
+                },
+                "processes": {
+                  "measurement": ["running", "sleeping", "dead"],
+                  "metrics_collection_interval": 60
+                }
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/gunicorn-access.log",
+                      "log_group_name": "/medical-app/gunicorn/access",
+                      "log_stream_name": "{instance_id}",
+                      "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
+                    },
+                    {
+                      "file_path": "/var/log/gunicorn-error.log",
+                      "log_group_name": "/medical-app/gunicorn/errors",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/nginx/access.log",
+                      "log_group_name": "/medical-app/nginx/access",
+                      "log_stream_name": "{instance_id}",
+                      "timestamp_format": "%d/%b/%Y:%H:%M:%S %z"
+                    },
+                    {
+                      "file_path": "/var/log/nginx/error.log",
+                      "log_group_name": "/medical-app/nginx/errors",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/mysql/error.log",
+                      "log_group_name": "/medical-app/mysql/errors",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/medical-bootstrap.log",
+                      "log_group_name": "/medical-app/bootstrap",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/tmp/backend.log",
+                      "log_group_name": "/medical-app/django/runtime",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              },
+              "force_flush_interval": 30
+            }
+          }
+          AGENT_CONFIG
+
+      - name: Generer credentials AWS pour l'agent et le health check
+        env:
+          AWS_AK: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SK: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ST: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          cat > /tmp/cw_credentials << EOF
+          [default]
+          aws_access_key_id     = ${AWS_AK}
+          aws_secret_access_key = ${AWS_SK}
+          aws_session_token     = ${AWS_ST}
+
+          [AmazonCloudWatchAgent]
+          aws_access_key_id     = ${AWS_AK}
+          aws_secret_access_key = ${AWS_SK}
+          aws_session_token     = ${AWS_ST}
+          EOF
+
+      - name: Generer script health check HTTP
+        run: |
+          cat > /tmp/healthcheck.sh << 'HEALTH_SCRIPT'
+          #!/bin/bash
+          # Envoie 4 metriques custom vers CloudWatch toutes les 5 min (via cron).
+          # FrontendHealthy, ApiHealthy, MysqlHealthy, AppHealthy (1=OK, 0=DOWN)
+          REGION="us-east-1"
+          NAMESPACE="MedicalApp/Application"
+          INSTANCE_ID=$(curl -s --max-time 3 \
+            http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")
+
+          check() {
+            local code
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$1" 2>/dev/null || echo "000")
+            [ "$code" = "200" ] && echo 1 || echo 0
+          }
+
+          FRONTEND_OK=$(check "http://localhost/")
+          API_OK=$(check "http://localhost:8000/api/account/login/")
+          MYSQL_OK=0
+          systemctl is-active --quiet mysql 2>/dev/null && MYSQL_OK=1
+          APP_OK=$(( FRONTEND_OK & API_OK & MYSQL_OK ))
+
+          export AWS_DEFAULT_REGION="$REGION"
+
+          aws cloudwatch put-metric-data \
+            --region "$REGION" \
+            --namespace "$NAMESPACE" \
+            --metric-data "[
+              {\"MetricName\":\"FrontendHealthy\",\"Value\":$FRONTEND_OK,\"Unit\":\"None\",
+               \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$INSTANCE_ID\"}]},
+              {\"MetricName\":\"ApiHealthy\",\"Value\":$API_OK,\"Unit\":\"None\",
+               \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$INSTANCE_ID\"}]},
+              {\"MetricName\":\"MysqlHealthy\",\"Value\":$MYSQL_OK,\"Unit\":\"None\",
+               \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$INSTANCE_ID\"}]},
+              {\"MetricName\":\"AppHealthy\",\"Value\":$APP_OK,\"Unit\":\"None\",
+               \"Dimensions\":[{\"Name\":\"InstanceId\",\"Value\":\"$INSTANCE_ID\"}]}
+            ]" 2>/dev/null || true
+          HEALTH_SCRIPT
+
+      - name: Generer script alarme disque (dimensions detectees sur l'instance)
+        env:
+          ACCOUNT_ID: ${{ needs.prepare.outputs.account_id }}
+        run: |
+          cat > /tmp/disk_alarm.sh << EOF
+          #!/bin/bash
+          # Cree l'alarme CloudWatch pour le disque / avec les dimensions exactes
+          # que l'agent envoie (device + fstype detectes localement).
+          REGION="us-east-1"
+          ACCOUNT_ID="${ACCOUNT_ID}"
+          SNS_ARN="arn:aws:sns:\${REGION}:\${ACCOUNT_ID}:medical-app-alerts"
+          INSTANCE_ID=\$(curl -s --max-time 3 \
+            http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")
+          DISK_DEVICE=\$(df --output=source / | tail -1 | sed 's|/dev/||')
+          DISK_FSTYPE=\$(df --output=fstype / | tail -1)
+
+          export AWS_DEFAULT_REGION="\$REGION"
+
+          echo "  Disque : device=\$DISK_DEVICE  fstype=\$DISK_FSTYPE"
+
+          aws cloudwatch put-metric-alarm \\
+            --alarm-name "medical-app-disk-high" \\
+            --alarm-description "Disque / depasse 85%" \\
+            --namespace MedicalApp/System \\
+            --metric-name disk_used_percent \\
+            --dimensions \\
+              "Name=InstanceId,Value=\$INSTANCE_ID" \\
+              "Name=path,Value=/" \\
+              "Name=device,Value=\$DISK_DEVICE" \\
+              "Name=fstype,Value=\$DISK_FSTYPE" \\
+            --statistic Average \\
+            --period 300 --evaluation-periods 1 \\
+            --threshold 85 \\
+            --comparison-operator GreaterThanThreshold \\
+            --alarm-actions "\$SNS_ARN" --ok-actions "\$SNS_ARN" \\
+            --treat-missing-data notBreaching \\
+            && echo "  Alarme disque creee" \\
+            || echo "  WARN: alarme disque echouee"
+          EOF
+
+      - name: Deployer tous les fichiers sur l'instance
+        env:
+          SERVER_IP: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/labsuser.pem \
+            /tmp/cloudwatch-agent.json \
+            /tmp/cw_credentials \
+            /tmp/healthcheck.sh \
+            /tmp/disk_alarm.sh \
+            ubuntu@"$SERVER_IP":/tmp/
+
+      - name: Installer et demarrer l'agent sur l'instance
+        env:
+          SERVER_IP: ${{ needs.prepare.outputs.target_ip }}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/labsuser.pem ubuntu@"$SERVER_IP" << 'REMOTE'
+          set -e
+
+          echo "=== [1/6] Installation CloudWatch Agent ==="
+          if ! command -v amazon-cloudwatch-agent-ctl &>/dev/null; then
+            cd /tmp
+            wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+            sudo dpkg -i -q amazon-cloudwatch-agent.deb
+            rm -f amazon-cloudwatch-agent.deb
+            echo "  Agent installe"
+          else
+            echo "  Agent deja present"
+          fi
+
+          echo "=== [2/6] Configuration metriques + logs ==="
+          sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+          sudo cp /tmp/cloudwatch-agent.json \
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+          echo "=== [3/6] Credentials AWS ==="
+          sudo mkdir -p /root/.aws
+          sudo cp /tmp/cw_credentials /root/.aws/credentials
+          sudo chmod 600 /root/.aws/credentials
+
+          echo "=== [4/6] Demarrage agent ==="
+          sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+            -s
+          sleep 3
+          STATUS=$(sudo systemctl is-active amazon-cloudwatch-agent 2>/dev/null || echo "unknown")
+          echo "  Etat agent : $STATUS"
+
+          echo "=== [5/6] Health check HTTP (cron toutes les 5 min) ==="
+          sudo mkdir -p /opt/healthcheck
+          sudo cp /tmp/healthcheck.sh /opt/healthcheck/healthcheck.sh
+          sudo chmod +x /opt/healthcheck/healthcheck.sh
+          sudo tee /etc/cron.d/medical-healthcheck > /dev/null << 'CRON'
+          AWS_DEFAULT_REGION=us-east-1
+          */5 * * * * root /opt/healthcheck/healthcheck.sh
+          CRON
+          sudo chmod 644 /etc/cron.d/medical-healthcheck
+          echo "  Cron installe : /etc/cron.d/medical-healthcheck"
+
+          echo "=== [6/6] Installer AWS CLI (pour health check + alarme disque) ==="
+          if ! command -v aws &>/dev/null; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+              -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp/
+            sudo /tmp/aws/install --update -q
+            rm -rf /tmp/awscliv2.zip /tmp/aws/
+            echo "  AWS CLI installe : $(aws --version 2>&1)"
+          else
+            echo "  AWS CLI deja present : $(aws --version 2>&1)"
+          fi
+
+          # Copier les credentials aussi pour l'utilisateur ubuntu
+          mkdir -p /home/ubuntu/.aws
+          cp /tmp/cw_credentials /home/ubuntu/.aws/credentials
+          chmod 600 /home/ubuntu/.aws/credentials
+
+          echo "=== Alarme disque (dimensions detectees localement) ==="
+          chmod +x /tmp/disk_alarm.sh
+          sudo bash /tmp/disk_alarm.sh
+
+          rm -f /tmp/cloudwatch-agent.json /tmp/cw_credentials \
+                /tmp/healthcheck.sh /tmp/disk_alarm.sh
+
+          echo "Setup agent complet"
+          REMOTE
+
+  # ── Job 2 : Alarmes CloudWatch + SNS + Retention logs ───────────────────
+  cloudwatch-alarms:
+    name: "Phase 2 - Alarmes CloudWatch + SNS + Retention"
+    runs-on: ubuntu-latest
+    needs: [prepare, cloudwatch-agent]
+    if: always() && needs.prepare.result == 'success'
+    steps:
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Creer topic SNS et souscription email
+        id: sns
+        run: |
+          TOPIC_ARN=$(aws sns create-topic \
+            --name "medical-app-alerts" \
+            --query TopicArn --output text)
+          echo "topic_arn=$TOPIC_ARN" >> "$GITHUB_OUTPUT"
+          echo "Topic SNS : $TOPIC_ARN"
+
+          EMAIL="${{ secrets.SNS_ALERT_EMAIL }}"
+          if [ -n "$EMAIL" ]; then
+            aws sns subscribe \
+              --topic-arn "$TOPIC_ARN" \
+              --protocol email \
+              --notification-endpoint "$EMAIL" 2>/dev/null || true
+            echo "  Email de confirmation envoye a : $EMAIL"
+            echo "  (Vous devez cliquer sur le lien de confirmation dans le mail)"
+          else
+            echo "  WARN: secret SNS_ALERT_EMAIL non configure — aucune notification email"
+          fi
+
+      - name: Alarmes systeme (CPU, Memoire, Status EC2)
+        env:
+          INSTANCE_ID: ${{ needs.prepare.outputs.instance_id }}
+          TOPIC_ARN:   ${{ steps.sns.outputs.topic_arn }}
+        run: |
+          DIM="Name=InstanceId,Value=$INSTANCE_ID"
+
+          echo "--- CPU > 80% pendant 5 min ---"
+          aws cloudwatch put-metric-alarm \
+            --alarm-name "medical-app-cpu-high" \
+            --alarm-description "CPU EC2 depasse 80% pendant 5 min" \
+            --namespace AWS/EC2 --metric-name CPUUtilization \
+            --dimensions "$DIM" \
+            --statistic Average --period 300 --evaluation-periods 1 \
+            --threshold 80 --comparison-operator GreaterThanThreshold \
+            --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN" \
+            --treat-missing-data notBreaching
+
+          echo "--- Memoire > 85% ---"
+          aws cloudwatch put-metric-alarm \
+            --alarm-name "medical-app-memory-high" \
+            --alarm-description "Memoire utilisee depasse 85%" \
+            --namespace MedicalApp/System --metric-name mem_used_percent \
+            --dimensions "$DIM" \
+            --statistic Average --period 300 --evaluation-periods 1 \
+            --threshold 85 --comparison-operator GreaterThanThreshold \
+            --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN" \
+            --treat-missing-data notBreaching
+
+          echo "--- Status check instance EC2 ---"
+          aws cloudwatch put-metric-alarm \
+            --alarm-name "medical-app-instance-check" \
+            --alarm-description "Status check instance EC2 echoue" \
+            --namespace AWS/EC2 --metric-name StatusCheckFailed \
+            --dimensions "$DIM" \
+            --statistic Maximum --period 60 --evaluation-periods 2 \
+            --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+            --alarm-actions "$TOPIC_ARN" \
+            --treat-missing-data breaching
+
+          echo "Alarmes systeme creees"
+
+      - name: Alarmes application (Frontend, API, MySQL, App globale)
+        env:
+          INSTANCE_ID: ${{ needs.prepare.outputs.instance_id }}
+          TOPIC_ARN:   ${{ steps.sns.outputs.topic_arn }}
+        run: |
+          DIM="Name=InstanceId,Value=$INSTANCE_ID"
+
+          for METRIC_NAME in FrontendHealthy ApiHealthy MysqlHealthy AppHealthy; do
+            case "$METRIC_NAME" in
+              FrontendHealthy) DESC="Frontend React (nginx :80) ne repond pas"      ; NAME="medical-app-frontend-down" ;;
+              ApiHealthy)      DESC="API Django/Gunicorn (:8000) ne repond pas"      ; NAME="medical-app-api-down"      ;;
+              MysqlHealthy)    DESC="MySQL arrete sur l'instance EC2"                ; NAME="medical-app-mysql-down"    ;;
+              AppHealthy)      DESC="Application medicale entierement inaccessible"  ; NAME="medical-app-health-global" ;;
+            esac
+
+            echo "--- $NAME ---"
+            aws cloudwatch put-metric-alarm \
+              --alarm-name "$NAME" \
+              --alarm-description "$DESC" \
+              --namespace MedicalApp/Application \
+              --metric-name "$METRIC_NAME" \
+              --dimensions "$DIM" \
+              --statistic Minimum --period 300 --evaluation-periods 2 \
+              --threshold 1 --comparison-operator LessThanThreshold \
+              --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN" \
+              --treat-missing-data breaching
+          done
+
+          echo "Alarmes application creees"
+
+      - name: Retention logs CloudWatch 30 jours
+        run: |
+          LOG_GROUPS=(
+            "/medical-app/gunicorn/access"
+            "/medical-app/gunicorn/errors"
+            "/medical-app/nginx/access"
+            "/medical-app/nginx/errors"
+            "/medical-app/mysql/errors"
+            "/medical-app/django/runtime"
+            "/medical-app/bootstrap"
+          )
+
+          for GROUP in "${LOG_GROUPS[@]}"; do
+            aws logs create-log-group --log-group-name "$GROUP" 2>/dev/null || true
+            aws logs put-retention-policy \
+              --log-group-name "$GROUP" \
+              --retention-in-days 30
+            echo "  Retention 30j : $GROUP"
+          done
+
+  # ── Job 3 : CloudTrail (audit API AWS) ──────────────────────────────────
+  cloudtrail:
+    name: "Phase 3 - CloudTrail"
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Bucket S3 + activation CloudTrail
+        env:
+          ACCOUNT_ID: ${{ needs.prepare.outputs.account_id }}
+        run: |
+          BUCKET_NAME="medical-cloudtrail-${ACCOUNT_ID}"
+          TRAIL_NAME="medical-app-trail"
+          REGION="${{ env.AWS_REGION }}"
+
+          echo "=== Bucket S3 : $BUCKET_NAME ==="
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            aws s3api create-bucket \
+              --bucket "$BUCKET_NAME" \
+              --region "$REGION" 2>/dev/null \
+              && echo "  Bucket cree" \
+              || { echo "  WARN: creation bucket limitee (Learner Lab) — CloudTrail ignore"; exit 0; }
+
+            aws s3api put-public-access-block \
+              --bucket "$BUCKET_NAME" \
+              --public-access-block-configuration \
+                "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+              2>/dev/null || true
+          else
+            echo "  Bucket existant"
+          fi
+
+          # Politique obligatoire pour que CloudTrail ecrive dans le bucket
+          aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$(cat << POLICY
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AWSCloudTrailAclCheck",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:GetBucketAcl",
+                "Resource": "arn:aws:s3:::${BUCKET_NAME}"
+              },
+              {
+                "Sid": "AWSCloudTrailWrite",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::${BUCKET_NAME}/AWSLogs/${ACCOUNT_ID}/*",
+                "Condition": {
+                  "StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}
+                }
+              }
+            ]
+          }
+          POLICY
+          )" 2>/dev/null || echo "  WARN: politique bucket echouee"
+
+          echo "=== CloudTrail : $TRAIL_NAME ==="
+          EXISTING=$(aws cloudtrail describe-trails \
+            --query "trailList[?Name=='${TRAIL_NAME}'].Name" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING" ] || [ "$EXISTING" = "None" ]; then
+            aws cloudtrail create-trail \
+              --name "$TRAIL_NAME" \
+              --s3-bucket-name "$BUCKET_NAME" \
+              --include-global-service-events \
+              --enable-log-file-validation 2>/dev/null \
+              && echo "  Trail cree avec validation des logs" \
+              || echo "  WARN: CloudTrail creation limitee (Learner Lab)"
+          else
+            echo "  Trail existant : $EXISTING"
+          fi
+
+          aws cloudtrail start-logging --name "$TRAIL_NAME" 2>/dev/null || true
+
+          IS_LOGGING=$(aws cloudtrail get-trail-status \
+            --name "$TRAIL_NAME" \
+            --query "IsLogging" --output text 2>/dev/null || echo "inconnu")
+          echo "  Logging actif : $IS_LOGGING"
+          echo "  Logs stockes dans s3://${BUCKET_NAME}/AWSLogs/${ACCOUNT_ID}/"
+
+  # ── Job 4 : Dashboard CloudWatch ────────────────────────────────────────
+  dashboard:
+    name: "Phase 4 - Dashboard CloudWatch"
+    runs-on: ubuntu-latest
+    needs: [prepare, cloudwatch-alarms]
+    if: always() && needs.prepare.result == 'success'
+    steps:
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Creer dashboard CloudWatch
+        env:
+          INSTANCE_ID: ${{ needs.prepare.outputs.instance_id }}
+          ACCOUNT_ID:  ${{ needs.prepare.outputs.account_id }}
+          REGION:      ${{ env.AWS_REGION }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys
+
+          R  = os.environ["REGION"]
+          ID = os.environ["INSTANCE_ID"]
+          AC = os.environ["ACCOUNT_ID"]
+
+          def alarm_arn(name):
+              return f"arn:aws:cloudwatch:{R}:{AC}:alarm:{name}"
+
+          def metric_w(title, metrics, x, y, w=8, h=6, ymax=None, threshold=None, stat="Average"):
+              props = {
+                  "title": title,
+                  "metrics": metrics,
+                  "period": 60,
+                  "stat": stat,
+                  "view": "timeSeries",
+                  "region": R
+              }
+              if ymax is not None:
+                  props["yAxis"] = {"left": {"min": 0, "max": ymax}}
+              if threshold is not None:
+                  props["annotations"] = {
+                      "horizontal": [{"value": threshold, "label": "Seuil alarme", "color": "#ff6961"}]
+                  }
+              return {"type": "metric", "x": x, "y": y, "width": w, "height": h, "properties": props}
+
+          def log_w(title, query, x, y, w=12, h=6):
+              return {
+                  "type": "log", "x": x, "y": y, "width": w, "height": h,
+                  "properties": {"title": title, "query": query, "region": R, "view": "table"}
+              }
+
+          widgets = [
+              # En-tete
+              {
+                  "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+                  "properties": {
+                      "markdown": (
+                          f"# Plateforme Medicale LEONI — Monitoring  "
+                          f"|  Instance: `{ID}`  |  Region: `{R}`"
+                      )
+                  }
+              },
+
+              # Ligne 1 : CPU / Memoire / Disque
+              metric_w(
+                  "CPU (%)",
+                  [["AWS/EC2", "CPUUtilization", "InstanceId", ID,
+                    {"label": "CPU total", "color": "#FF9900"}]],
+                  0, 1, ymax=100, threshold=80
+              ),
+              metric_w(
+                  "Memoire utilisee (%)",
+                  [["MedicalApp/System", "mem_used_percent", "InstanceId", ID,
+                    {"color": "#E91E63"}]],
+                  8, 1, ymax=100, threshold=85
+              ),
+              metric_w(
+                  "Disque / utilise (%)",
+                  [["MedicalApp/System", "disk_used_percent", "InstanceId", ID,
+                    {"color": "#9C27B0"}]],
+                  16, 1, ymax=100, threshold=85
+              ),
+
+              # Ligne 2 : Reseau / Disk I/O
+              {
+                  "type": "metric", "x": 0, "y": 7, "width": 12, "height": 6,
+                  "properties": {
+                      "title": "Trafic Reseau (bytes/min)",
+                      "metrics": [
+                          ["AWS/EC2", "NetworkIn", "InstanceId", ID,
+                           {"label": "Entrant", "color": "#2196F3", "stat": "Sum"}],
+                          ["AWS/EC2", "NetworkOut", "InstanceId", ID,
+                           {"label": "Sortant", "color": "#4CAF50", "stat": "Sum"}]
+                      ],
+                      "period": 60, "view": "timeSeries", "region": R
+                  }
+              },
+              {
+                  "type": "metric", "x": 12, "y": 7, "width": 12, "height": 6,
+                  "properties": {
+                      "title": "I/O Disque (ops/min)",
+                      "metrics": [
+                          ["MedicalApp/System", "diskio_reads", "InstanceId", ID,
+                           {"label": "Lectures", "stat": "Sum"}],
+                          ["MedicalApp/System", "diskio_writes", "InstanceId", ID,
+                           {"label": "Ecritures", "stat": "Sum", "color": "#FF5722"}]
+                      ],
+                      "period": 60, "view": "timeSeries", "region": R
+                  }
+              },
+
+              # Ligne 3 : CPU detail / Swap / Disponibilite app
+              {
+                  "type": "metric", "x": 0, "y": 13, "width": 8, "height": 6,
+                  "properties": {
+                      "title": "CPU Detail (user / system / iowait)",
+                      "metrics": [
+                          ["MedicalApp/System", "cpu_usage_user",   "InstanceId", ID, {"label": "User"}],
+                          ["MedicalApp/System", "cpu_usage_system", "InstanceId", ID, {"label": "System"}],
+                          ["MedicalApp/System", "cpu_usage_iowait", "InstanceId", ID,
+                           {"label": "IO Wait", "color": "#FF5722"}]
+                      ],
+                      "period": 60, "stat": "Average", "view": "timeSeries", "region": R
+                  }
+              },
+              metric_w(
+                  "Swap utilise (%)",
+                  [["MedicalApp/System", "swap_used_percent", "InstanceId", ID]],
+                  8, 13, ymax=100
+              ),
+              {
+                  "type": "metric", "x": 16, "y": 13, "width": 8, "height": 6,
+                  "properties": {
+                      "title": "Disponibilite Application (1=OK / 0=DOWN)",
+                      "metrics": [
+                          ["MedicalApp/Application", "FrontendHealthy", "InstanceId", ID,
+                           {"label": "Frontend :80",  "color": "#4CAF50"}],
+                          ["MedicalApp/Application", "ApiHealthy",      "InstanceId", ID,
+                           {"label": "API :8000",     "color": "#2196F3"}],
+                          ["MedicalApp/Application", "MysqlHealthy",    "InstanceId", ID,
+                           {"label": "MySQL",         "color": "#FF9800"}]
+                      ],
+                      "period": 300, "stat": "Minimum",
+                      "view": "timeSeries", "region": R,
+                      "yAxis": {"left": {"min": 0, "max": 1}}
+                  }
+              },
+
+              # Etat des alarmes
+              {
+                  "type": "alarm", "x": 0, "y": 19, "width": 24, "height": 4,
+                  "properties": {
+                      "title": "Etat des Alarmes",
+                      "alarms": [
+                          alarm_arn("medical-app-cpu-high"),
+                          alarm_arn("medical-app-memory-high"),
+                          alarm_arn("medical-app-disk-high"),
+                          alarm_arn("medical-app-instance-check"),
+                          alarm_arn("medical-app-health-global"),
+                          alarm_arn("medical-app-frontend-down"),
+                          alarm_arn("medical-app-api-down"),
+                          alarm_arn("medical-app-mysql-down")
+                      ]
+                  }
+              },
+
+              # Logs
+              log_w(
+                  "Erreurs Django / Gunicorn",
+                  "SOURCE '/medical-app/gunicorn/errors' "
+                  "| fields @timestamp, @message "
+                  "| filter @message like /ERROR|Exception|Traceback/ "
+                  "| sort @timestamp desc | limit 25",
+                  0, 23
+              ),
+              log_w(
+                  "Erreurs Nginx",
+                  "SOURCE '/medical-app/nginx/errors' "
+                  "| fields @timestamp, @message "
+                  "| sort @timestamp desc | limit 25",
+                  12, 23
+              ),
+              log_w(
+                  "Codes HTTP API — repartition",
+                  "SOURCE '/medical-app/nginx/access' "
+                  "| parse @message '* * [*] \"* *\" * *' as host, user, t, method, path, status, size "
+                  "| stats count() as hits by status "
+                  "| sort hits desc",
+                  0, 29
+              ),
+              log_w(
+                  "Erreurs MySQL",
+                  "SOURCE '/medical-app/mysql/errors' "
+                  "| fields @timestamp, @message "
+                  "| filter @message like /ERROR|Warning/ "
+                  "| sort @timestamp desc | limit 25",
+                  12, 29
+              )
+          ]
+
+          body = json.dumps({"widgets": widgets})
+          r = subprocess.run(
+              ["aws", "cloudwatch", "put-dashboard",
+               "--dashboard-name", "MedicalApp-Monitoring",
+               "--dashboard-body", body],
+              capture_output=True, text=True
+          )
+          if r.returncode == 0:
+              print(f"Dashboard cree avec succes :")
+              print(f"  https://console.aws.amazon.com/cloudwatch/home?region={R}"
+                    f"#dashboards:name=MedicalApp-Monitoring")
+          else:
+              print(f"Erreur creation dashboard : {r.stderr}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+  # ── Job 5 : Rapport final ────────────────────────────────────────────────
+  report:
+    name: "Phase 5 - Rapport Monitoring"
+    runs-on: ubuntu-latest
+    needs: [prepare, cloudwatch-agent, cloudwatch-alarms, cloudtrail, dashboard]
+    if: always()
+    steps:
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Synthese monitoring
+        env:
+          TARGET:         ${{ needs.prepare.outputs.target_ip }}
+          INSTANCE_ID:    ${{ needs.prepare.outputs.instance_id }}
+          AGENT_RESULT:   ${{ needs.cloudwatch-agent.result }}
+          ALARMS_RESULT:  ${{ needs.cloudwatch-alarms.result }}
+          TRAIL_RESULT:   ${{ needs.cloudtrail.result }}
+          DASH_RESULT:    ${{ needs.dashboard.result }}
+          REGION:         ${{ env.AWS_REGION }}
+        run: |
+          ALARMS=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "medical-app-" \
+            --query "MetricAlarms[].{Alarme:AlarmName,Etat:StateValue}" \
+            --output table 2>/dev/null || echo "  N/A")
+
+          echo ""
+          echo "======================================================================"
+          echo "  MONITORING — PLATEFORME MEDICALE LEONI"
+          echo "  Instance : $INSTANCE_ID  |  IP : $TARGET"
+          echo "======================================================================"
+          echo ""
+          echo "  Phase 1 - CloudWatch Agent    : $AGENT_RESULT"
+          echo "  Phase 2 - Alarmes + SNS       : $ALARMS_RESULT"
+          echo "  Phase 3 - CloudTrail          : $TRAIL_RESULT"
+          echo "  Phase 4 - Dashboard           : $DASH_RESULT"
+          echo ""
+          echo "  METRIQUES SYSTEME (toutes les 60s) :"
+          echo "  ├── CPU      : total, user, system, iowait"
+          echo "  ├── Memoire  : used%, available%, used (bytes), total (bytes)"
+          echo "  ├── Disque   : used%, inodes_free, disk_free"
+          echo "  ├── Disk I/O : reads, writes, read_bytes, write_bytes, iops"
+          echo "  ├── Reseau   : bytes_recv/sent, packets_recv/sent, err_in/out"
+          echo "  ├── Swap     : used%"
+          echo "  └── Processus: running, sleeping, dead"
+          echo ""
+          echo "  METRIQUES APPLICATION (toutes les 5 min via cron) :"
+          echo "  ├── FrontendHealthy : nginx :80        (1=OK / 0=DOWN)"
+          echo "  ├── ApiHealthy      : Django :8000     (1=OK / 0=DOWN)"
+          echo "  ├── MysqlHealthy    : systemctl mysql  (1=OK / 0=DOWN)"
+          echo "  └── AppHealthy      : combinaison      (1=OK / 0=DOWN)"
+          echo ""
+          echo "  LOGS CENTRALISES (retention 30 jours) :"
+          echo "  ├── /medical-app/gunicorn/access   (requetes HTTP Django)"
+          echo "  ├── /medical-app/gunicorn/errors   (erreurs Django/Python)"
+          echo "  ├── /medical-app/nginx/access      (requetes frontend)"
+          echo "  ├── /medical-app/nginx/errors      (erreurs nginx)"
+          echo "  ├── /medical-app/mysql/errors      (erreurs MySQL)"
+          echo "  ├── /medical-app/django/runtime    (logs Django runserver)"
+          echo "  └── /medical-app/bootstrap         (log demarrage EC2)"
+          echo ""
+          echo "  ALARMES (seuils + notification SNS) :"
+          echo "$ALARMS"
+          echo ""
+          echo "  LIENS CLOUDWATCH :"
+          echo "  Dashboard : https://console.aws.amazon.com/cloudwatch/home?region=$REGION#dashboards:name=MedicalApp-Monitoring"
+          echo "  Alarmes   : https://console.aws.amazon.com/cloudwatch/home?region=$REGION#alarmsV2:"
+          echo "  Logs      : https://console.aws.amazon.com/cloudwatch/home?region=$REGION#logsV2:log-groups"
+          echo ""
+          echo "  NOTE : Ajoutez le secret GitHub 'SNS_ALERT_EMAIL' pour activer"
+          echo "         les notifications email sur les alarmes."
+          echo "======================================================================"
