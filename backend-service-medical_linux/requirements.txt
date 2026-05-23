@@ -27,3 +27,4 @@ uritemplate==4.2.0
 urllib3==2.6.3
 django-csp
 django-permissions-policy
+gunicorn
