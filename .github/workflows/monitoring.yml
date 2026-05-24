@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       target_ip:
-        description: "IP cible (laisser vide = lire depuis terraform.tfstate)"
+        description: "IP cible (laisser vide = lire depuis AWS)"
         required: false
         type: string
 
@@ -50,13 +50,16 @@ jobs:
         run: |
           TARGET_IP="${{ github.event.inputs.target_ip }}"
 
-          if [ -z "$TARGET_IP" ] && [ -f terraform/terraform.tfstate ]; then
-            TARGET_IP=$(jq -r \
-              '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' \
-              terraform/terraform.tfstate 2>/dev/null || echo "")
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
+            echo "Lecture IP depuis AWS EC2..."
+            TARGET_IP=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=medical-app-server" \
+                        "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].PublicIpAddress" \
+              --output text 2>/dev/null || echo "")
           fi
 
-          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "None" ] || [ "$TARGET_IP" = "null" ]; then
             echo "ERREUR : IP introuvable. Deployez d'abord via deploy.yml"
             exit 1
           fi
@@ -653,7 +656,6 @@ jobs:
               }
 
           widgets = [
-              # En-tete
               {
                   "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
                   "properties": {
@@ -663,8 +665,6 @@ jobs:
                       )
                   }
               },
-
-              # Ligne 1 : CPU / Memoire / Disque
               metric_w(
                   "CPU (%)",
                   [["AWS/EC2", "CPUUtilization", "InstanceId", ID,
@@ -683,8 +683,6 @@ jobs:
                     {"color": "#9C27B0"}]],
                   16, 1, ymax=100, threshold=85
               ),
-
-              # Ligne 2 : Reseau / Disk I/O
               {
                   "type": "metric", "x": 0, "y": 7, "width": 12, "height": 6,
                   "properties": {
@@ -711,8 +709,6 @@ jobs:
                       "period": 60, "view": "timeSeries", "region": R
                   }
               },
-
-              # Ligne 3 : CPU detail / Swap / Disponibilite app
               {
                   "type": "metric", "x": 0, "y": 13, "width": 8, "height": 6,
                   "properties": {
@@ -748,8 +744,6 @@ jobs:
                       "yAxis": {"left": {"min": 0, "max": 1}}
                   }
               },
-
-              # Etat des alarmes
               {
                   "type": "alarm", "x": 0, "y": 19, "width": 24, "height": 4,
                   "properties": {
@@ -766,8 +760,6 @@ jobs:
                       ]
                   }
               },
-
-              # Logs
               log_w(
                   "Erreurs Django / Gunicorn",
                   "SOURCE '/medical-app/gunicorn/errors' "

@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       target_ip:
-        description: "IP cible (laisser vide = lire depuis terraform.tfstate)"
+        description: "IP cible (laisser vide = lire depuis AWS)"
         required: false
         type: string
   workflow_run:
@@ -21,12 +21,13 @@ permissions:
 # Forcer Node.js 24 pour eviter les warnings de deprecation Node.js 20
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  AWS_REGION: us-east-1
 
 # =============================================================
 #  DAST — 6 phases complementaires au SAST (tests.yml)
 #
 #  Ordre d'execution (du plus rapide au plus long) :
-#  0. prepare          → recuperer l'IP de la cible depuis tfstate
+#  0. prepare          → recuperer l'IP de la cible depuis AWS
 #  1. security-headers → verification en-tetes HTTP (CSP, HSTS, etc.)
 #  2. zap-passive      → OWASP ZAP scan passif (baseline, sans attaque)
 #  3. api-probes       → sondes actives : SQLi, XSS, bypass auth, IDOR
@@ -47,17 +48,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configurer AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            us-east-1
+
       - name: Determiner IP de la cible
         id: get_ip
         run: |
           TARGET_IP="${{ github.event.inputs.target_ip }}"
 
-          if [ -z "$TARGET_IP" ] && [ -f terraform/terraform.tfstate ]; then
-            TARGET_IP=$(jq -r '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' terraform/terraform.tfstate 2>/dev/null || echo "")
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
+            echo "Lecture IP depuis AWS EC2..."
+            TARGET_IP=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=medical-app-server" \
+                        "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].PublicIpAddress" \
+              --output text 2>/dev/null || echo "")
           fi
 
-          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "null" ]; then
-            echo "ERREUR : aucune IP trouvee dans tfstate. Deployez d abord via deploy.yml"
+          if [ -z "$TARGET_IP" ] || [ "$TARGET_IP" = "None" ] || [ "$TARGET_IP" = "null" ]; then
+            echo "ERREUR : aucune VM running trouvee sur AWS. Deployez d abord via deploy.yml"
             exit 1
           fi
 
