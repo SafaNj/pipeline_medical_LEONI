@@ -137,6 +137,31 @@ jobs:
         working-directory: ./terraform
         run: terraform init
 
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Nettoyer ressources orphelines AWS
+        run: |
+          echo "=== Suppression SG orphelin ==="
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=medical-app-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          if [ "$SG_ID" != "None" ] && [ "$SG_ID" != "null" ] && [ -n "$SG_ID" ]; then
+            echo "SG trouve: $SG_ID - suppression..."
+            aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || echo "SG en cours d'usage, on continue..."
+          fi
+          echo "=== Liberation EIPs orphelines ==="
+          for alloc in $(aws ec2 describe-addresses \
+            --query "Addresses[?AssociationId==null].AllocationId" \
+            --output text 2>/dev/null); do
+            echo "Liberation EIP: $alloc"
+            aws ec2 release-address --allocation-id "$alloc" 2>/dev/null || true
+          done
+
+      - name: Importer ressources AWS existantes
+        working-directory: ./terraform
+
       - name: Importer ressources AWS existantes
         working-directory: ./terraform
         run: |
