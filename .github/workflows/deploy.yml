@@ -10,7 +10,6 @@ env:
 
 jobs:
 
-  # ── Job 1 : verifier si une VM existe deja ──────────────────────────────
   check:
     name: "Job 1 - Check VM existante"
     runs-on: ubuntu-latest
@@ -32,13 +31,11 @@ jobs:
       - name: Verifier etat EC2 et demarrer si stoppee
         id: check_vm
         run: |
-          # Recuperer l'IP depuis le tfstate local
           SERVER_IP=""
           if [ -f terraform/terraform.tfstate ]; then
             SERVER_IP=$(jq -r '[.resources[] | select(.type=="aws_eip") | .instances[0].attributes.public_ip // ""] | first // ""' terraform/terraform.tfstate 2>/dev/null || echo "")
           fi
 
-          # Interroger AWS directement pour connaitre l'etat reel de l'instance
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=medical-app-server" \
                       "Name=instance-state-name,Values=running,stopped" \
@@ -54,14 +51,11 @@ jobs:
           echo "Instance ID    : $INSTANCE_ID"
           echo "Instance State : $INSTANCE_STATE"
 
-          # Instance stoppee intentionnellement : la demarrer, NE PAS la recreer
           if [ "$INSTANCE_STATE" = "stopped" ]; then
             echo "Instance stoppee detectee — demarrage sans recreation..."
             aws ec2 start-instances --instance-ids "$INSTANCE_ID"
-            echo "Attente etat 'running' (max 5 min)..."
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
 
-            # Recuperer l'IP si elle n'etait pas dans le tfstate
             if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "null" ]; then
               SERVER_IP=$(aws ec2 describe-instances \
                 --instance-ids "$INSTANCE_ID" \
@@ -69,7 +63,6 @@ jobs:
                 --output text 2>/dev/null || echo "")
             fi
 
-            echo "Attente SSH sur $SERVER_IP (max 5 min)..."
             mkdir -p ~/.ssh
             echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
             chmod 600 ~/.ssh/labsuser.pem
@@ -79,7 +72,6 @@ jobs:
                 echo "SSH pret apres $((i * 10))s"
                 break
               fi
-              echo "  Tentative SSH $i/30..."
               sleep 10
             done
 
@@ -88,9 +80,7 @@ jobs:
             exit 0
           fi
 
-          # Instance deja en cours d'execution : verifier SSH
           if [ "$INSTANCE_STATE" = "running" ] && [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
-            echo "Instance running — verification SSH sur $SERVER_IP..."
             mkdir -p ~/.ssh
             echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/labsuser.pem
             chmod 600 ~/.ssh/labsuser.pem
@@ -102,12 +92,10 @@ jobs:
             fi
           fi
 
-          # Aucune instance trouvee (ni running ni stopped) : Terraform cree une nouvelle
           echo "Aucune instance existante — creation via Terraform"
           echo "vm_exists=false" >> "$GITHUB_OUTPUT"
           echo "server_ip="      >> "$GITHUB_OUTPUT"
 
-  # ── Job 2 : provisionner EC2 via Terraform ──────────────────────────────
   terraform:
     name: "Job 2 - Provision EC2"
     runs-on: ubuntu-latest
@@ -137,10 +125,6 @@ jobs:
         working-directory: ./terraform
         run: terraform init
 
-      - name: Terraform Init
-        working-directory: ./terraform
-        run: terraform init
-
       - name: Nettoyer ressources orphelines AWS
         run: |
           echo "=== Suppression SG orphelin ==="
@@ -158,9 +142,6 @@ jobs:
             echo "Liberation EIP: $alloc"
             aws ec2 release-address --allocation-id "$alloc" 2>/dev/null || true
           done
-
-      - name: Importer ressources AWS existantes
-        working-directory: ./terraform
 
       - name: Importer ressources AWS existantes
         working-directory: ./terraform
@@ -211,7 +192,6 @@ jobs:
           git diff --cached --quiet || git commit -m "chore: update terraform state [skip ci]"
           git push || echo "Push state echoue"
 
-  # ── Job 3 : deployer l'application ──────────────────────────────────────
   setup:
     name: "Job 3 - Deploy Application"
     runs-on: ubuntu-latest
@@ -269,7 +249,6 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/labsuser.pem ubuntu@"$SERVER_IP" "chmod +x /tmp/setup.sh && sudo VM_EXISTS='$VM_EXISTS' ELASTIC_IP='$ELASTIC_IP' DB_APP_PASSWORD='$DB_APP_PASSWORD' MYSQL_ROOT_PASSWORD='$MYSQL_ROOT_PASSWORD' bash /tmp/setup.sh"
 
-  # ── Job 4 : demarrer les services ───────────────────────────────────────
   run:
     name: "Job 4 - Start Services"
     runs-on: ubuntu-latest
