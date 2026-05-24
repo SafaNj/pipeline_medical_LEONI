@@ -3,6 +3,10 @@ name: "Deploy Medical Project"
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.github/workflows/dast.yml'
+      - '.github/workflows/monitoring.yml'
+      - '**.md'
 
 env:
   AWS_REGION: us-east-1
