@@ -318,7 +318,7 @@ jobs:
           if ! command -v amazon-cloudwatch-agent-ctl &>/dev/null; then
             cd /tmp
             wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-            sudo dpkg -i -q amazon-cloudwatch-agent.deb
+            sudo dpkg -i amazon-cloudwatch-agent.deb
             rm -f amazon-cloudwatch-agent.deb
             echo "  Agent installe"
           else
