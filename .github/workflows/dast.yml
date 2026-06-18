@@ -343,7 +343,7 @@ jobs:
           name: zap-active-reports
           path: "*.html"
 
-  # ── Job 6 : synthese DAST ────────────────────────────────────────────────
+  # ── Job 6 : synthese DAST ───────────────────────────
   report:
     name: "Phase 6 - Synthese DAST"
     runs-on: ubuntu-latest
