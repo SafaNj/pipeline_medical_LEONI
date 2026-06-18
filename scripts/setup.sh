@@ -1,7 +1,8 @@
 #!/bin/bash
 # setup.sh — deploiement/mise a jour idempotent de l'application medicale.
 # VM_EXISTS=false → nouvelle VM (user_data bootstrap en cours, on attend).
-# VM_EXISTS=true  → VM existante, mise a jour complete.
+# VM_EXISTS=true  → VM ex
+istante, mise a jour complete.
 set -euo pipefail
 exec > >(tee /var/log/setup.log 2>&1) 2>&1
 
