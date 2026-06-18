@@ -8,6 +8,8 @@ on:
       - '.github/workflows/monitoring.yml'
       - '**.md'
 
+workflow_dispatch:
+
 env:
   AWS_REGION: us-east-1
   TF_VERSION: "1.7.5"
