@@ -84,8 +84,22 @@ source "$INSTALL_DIR/venv/bin/activate"
 
 pip install --upgrade pip -q
 pip install -r "$INSTALL_DIR/requirements.txt" -q
+
+# Forcer gunicorn : l'archive backend telechargee est figee (release v1.0) et
+# peut avoir un requirements.txt legerement different du repo actuel.
+# On garantit ici que le binaire existe vraiment avant de continuer,
+# sinon le service systemd plantera plus tard avec "status=203/EXEC".
+pip install --upgrade gunicorn -q
 deactivate
-echo "  Venv recrée et dependances installees"
+
+GUNICORN_BIN="$INSTALL_DIR/venv/bin/gunicorn"
+if [ ! -x "$GUNICORN_BIN" ]; then
+  echo "  ERREUR FATALE: gunicorn introuvable apres installation ($GUNICORN_BIN)"
+  echo "  Contenu de $INSTALL_DIR/venv/bin/ :"
+  ls -la "$INSTALL_DIR/venv/bin/" || true
+  exit 1
+fi
+echo "  Venv recree et dependances installees (gunicorn: $("$GUNICORN_BIN" --version))"
 
 # Patch STATIC_ROOT si absent
 grep -q "STATIC_ROOT" "$INSTALL_DIR/medical_platform/settings.py" || \
@@ -102,6 +116,20 @@ cd "$INSTALL_DIR"
 "$INSTALL_DIR/venv/bin/python" manage.py collectstatic --noinput 2>/dev/null || true
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+
+echo ""
+echo "=== [4b/8] Redemarrage du service systemd medical-backend (Gunicorn) ==="
+# On ne laisse JAMAIS le backend a l'arret : c'est systemd qui le gere
+# (Restart=always + enable au boot), jamais un nohup/runserver manuel.
+systemctl daemon-reload
+systemctl enable medical-backend
+systemctl restart medical-backend
+sleep 3
+if systemctl is-active --quiet medical-backend; then
+  echo "  medical-backend actif (OK)"
+else
+  echo "  ATTENTION: medical-backend n'a pas demarre, voir 'journalctl -u medical-backend'"
+fi
 
 echo ""
 echo "=== [5/8] Correctifs noms de fichiers (case-sensitive Linux) ==="
@@ -242,6 +270,6 @@ rm -rf /tmp/backend_new_raw /tmp/frontend_new_raw
 echo ""
 echo "=========================================================="
 echo "  Setup termine — $(date)"
-echo "  Backend pret sur :8000 (sera lance par Job 4)"
+echo "  Backend actif sur :8000 via systemd (medical-backend.service)"
 echo "  Frontend servi par nginx sur :80"
 echo "=========================================================="
