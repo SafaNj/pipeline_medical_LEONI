@@ -32,6 +32,20 @@ def load_json(path: str):
         return None
 
 
+def get_deps_list(data) -> list[dict]:
+    """
+    Normalise le JSON pip-audit, quel que soit son format :
+    - ancien format : liste directe [{...}, {...}, ...]
+    - nouveau format : dict {"dependencies": [...], "fixes": [...]}
+    Retourne toujours une liste de dépendances (dicts).
+    """
+    if isinstance(data, dict):
+        return data.get("dependencies", [])
+    if isinstance(data, list):
+        return data
+    return []
+
+
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         print("[DRY-RUN] Telegram non configuré — message:\n" + text[:300])
@@ -139,13 +153,7 @@ def parse_pipaudit(data) -> list[dict]:
     Retourne une liste de paquets vulnérables :
     [{name, version, cves: [{id, desc, fix_versions}]}]
     """
-    if data is None:
-        return []
-    # pip-audit JSON: liste directe ou {dependencies: [...]}
-    if isinstance(data, dict):
-        deps = data.get("dependencies", [])
-    else:
-        deps = data
+    deps = get_deps_list(data)
 
     vulnerable = []
     for dep in deps:
@@ -269,10 +277,13 @@ def main() -> int:
     pipaudit_data = load_json("pipaudit_results.json")
     bandit_data   = load_json("bandit_results.json")
 
+    # Normalisation unique du format pip-audit (ancien: liste / nouveau: dict)
+    deps_list = get_deps_list(pipaudit_data)
+
     vulnerable_pkgs          = parse_pipaudit(pipaudit_data)
     bandit_high, bandit_med, bandit_top = parse_bandit(bandit_data)
 
-    total_deps   = len(pipaudit_data) if isinstance(pipaudit_data, list) else 0
+    total_deps   = len(deps_list)
     total_cves   = sum(len(p["cves"]) for p in vulnerable_pkgs)
 
     print(f"[INFO] Packages vulnérables : {len(vulnerable_pkgs)}")
@@ -325,7 +336,7 @@ def main() -> int:
 
     # Points positifs
     positives = []
-    safe_pkgs = [d for d in (pipaudit_data or []) if not d.get("vulns")]
+    safe_pkgs = [d for d in deps_list if not d.get("vulns")]
     if safe_pkgs:
         names = ", ".join(d["name"] for d in safe_pkgs[:4])
         positives.append(f"{len(safe_pkgs)} package(s) sans CVE : {names}")
