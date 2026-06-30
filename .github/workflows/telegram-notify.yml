@@ -7,6 +7,8 @@ on:
     workflows: ["DAST - Tests Dynamiques de Securite"]
     types: [completed]
   workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'   # Scan automatique chaque jour à 6h UTC
     inputs:
       force_alert:
         description: "Forcer l'envoi d'une alerte même sans CVE"
