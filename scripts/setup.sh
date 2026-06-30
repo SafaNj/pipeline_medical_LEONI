@@ -52,7 +52,8 @@ fuser -k 8000/tcp 2>/dev/null || true
 systemctl stop medical-backend 2>/dev/null || true
 sleep 2
 
-# Telecharger et extraire
+
+
 echo "  Telechargement backend..."
 curl -fL --retry 3 -o /tmp/backend_new.zip "$BACKEND_URL"
 unzip -o /tmp/backend_new.zip -d /tmp/backend_new_raw

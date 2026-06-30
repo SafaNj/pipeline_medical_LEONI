@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Correctifs de sécurité — Pipeline médical LEONI
+# Versions vérifiées sur les sources officielles (Django Project, GitHub
+# Security Advisories, NVD, Debian Security Tracker) — pas les suggestions
+# de l'IA Mistral dans les alertes Telegram, qui contenaient des erreurs.
+# Généré le 29/06/2026
+# ─────────────────────────────────────────────────────────────────────────
+
+# Django — corrige CVE-2026-33033, CVE-2026-33034, CVE-2026-4292,
+# CVE-2026-4277, CVE-2026-3902 (release de sécurité du 7 avril 2026)
+# ATTENTION : 5.2.12 est INSUFFISANT, le vrai correctif est en 5.2.13
+Django==5.2.13
+
+# idna — corrige CVE-2026-45409 (bypass du correctif CVE-2024-3651, DoS via
+# idna.encode() sur entrées spécialement conçues)
+idna==3.15
+
+# Pillow — corrige CVE-2026-42308, CVE-2026-40192, CVE-2026-42309,
+# CVE-2026-42310 (dépassements d'entier / DoS via fichiers malveillants)
+Pillow==12.2.0
+
+# PyJWT — corrige CVE-2026-32597 (validation du paramètre crit),
+# CVE-2026-48526 (confusion d'algorithme via JWK brut comme secret HMAC),
+# CVE-2026-48522, CVE-2026-48524 (PyJWKClient : restrictions de schéma/SSRF)
+PyJWT==2.13.0
