@@ -8,6 +8,8 @@ class AccidentTravail(models.Model):
     CATEGORIE_CHOICES = [
         (CATEGORIE_TRAVAIL, "Accident de travail"),
         (CATEGORIE_TRAJET, "Accident de trajet"),
+        (CATEGORIE_TRAJET, "Accident de trajet"),
+
     ]
 
     collaborateur = models.ForeignKey(
