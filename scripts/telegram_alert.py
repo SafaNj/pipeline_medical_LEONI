@@ -263,7 +263,6 @@ def format_audit_report(
     )
 
 
-# ── Point d'entrée ────────────────────────────────────────────────────────────
 
 def main() -> int:
     now     = datetime.now(timezone.utc)
